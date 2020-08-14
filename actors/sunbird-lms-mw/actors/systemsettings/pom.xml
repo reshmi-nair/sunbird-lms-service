@@ -71,6 +71,7 @@
                 <version>2.20</version>
                 <configuration>
                     <includes>
+                        <argLine>-Xmx1024m -XX:MaxPermSize=256m</argLine>
                         <include>**/*Spec.java</include>
                         <include>**/*Test.java</include>
                     </includes>
