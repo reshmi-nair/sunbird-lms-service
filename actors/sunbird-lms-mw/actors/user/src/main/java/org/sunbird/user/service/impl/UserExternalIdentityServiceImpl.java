@@ -10,7 +10,7 @@ import org.sunbird.user.util.UserExternalIdentityAdapter;
 import org.sunbird.user.util.UserUtil;
 
 public class UserExternalIdentityServiceImpl implements UserExternalIdentityService {
-  private static UserExternalIdentityDao userExternalIdentityDao =
+  private UserExternalIdentityDao userExternalIdentityDao =
       new UserExternalIdentityDaoImpl();
 
   @Override

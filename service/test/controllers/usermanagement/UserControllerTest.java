@@ -23,6 +23,7 @@ import org.sunbird.common.models.response.ResponseParams;
 import org.sunbird.common.models.util.*;
 import org.sunbird.common.request.HeaderParam;
 import org.sunbird.common.responsecode.ResponseCode;
+import org.sunbird.learner.util.UserUtility;
 import org.sunbird.models.user.UserDeclareEntity;
 import play.libs.Json;
 import play.mvc.Http;
@@ -30,12 +31,13 @@ import play.mvc.Http.RequestBuilder;
 import play.mvc.Result;
 import play.test.Helpers;
 import util.CaptchaHelper;
+import util.RequestInterceptor;
 
 @PrepareForTest({
   OnRequestHandler.class,
   CaptchaHelper.class,
   ProjectUtil.class,
-  HttpClientUtil.class
+  HttpClientUtil.class, RequestInterceptor.class
 })
 public class UserControllerTest extends BaseApplicationTest {
 
@@ -68,8 +70,14 @@ public class UserControllerTest extends BaseApplicationTest {
   }
 
   @Test
-  public void testCreateUserSuccess() {
+  public void testCreateUserSuccess() throws Exception{
 
+    Map userAuthentication = new HashMap<String, String>();
+    userAuthentication.put(JsonKey.USER_ID, "userId");
+    PowerMockito.mockStatic(RequestInterceptor.class);
+   when(RequestInterceptor.verifyRequestData(Mockito.any())).thenReturn(userAuthentication);
+    PowerMockito.mockStatic(OnRequestHandler.class);
+    PowerMockito.doReturn("12345678990").when(OnRequestHandler.class, "getCustodianOrgHashTagId");
     Result result =
         performTest(
             "/v1/user/create",

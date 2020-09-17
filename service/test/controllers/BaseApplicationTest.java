@@ -34,17 +34,20 @@ import util.RequestInterceptor;
 
 @RunWith(PowerMockRunner.class)
 @PowerMockIgnore("javax.management.*")
-@PrepareForTest({RequestInterceptor.class, TelemetryWriter.class, SunbirdMWService.class})
+@PrepareForTest({RequestInterceptor.class, TelemetryWriter.class,
+        OnRequestHandler.class,
+        ActorRef.class,
+        SunbirdMWService.class})
 public abstract class BaseApplicationTest {
   protected Application application;
   private ActorSystem system;
   private Props props;
+  private SunbirdMWService app;
+  private static ActorRef subject;
 
   public <T> void setup(Class<T> actorClass) {
     PowerMockito.mockStatic(SunbirdMWService.class);
-    SunbirdMWService.tellToBGRouter(Mockito.any(), Mockito.any());
-    Map userAuthentication = new HashMap<String, String>();
-    userAuthentication.put(JsonKey.USER_ID, "userId");
+//    SunbirdMWService.tellToBGRouter(Mockito.any(), Mockito.any());
     try {
       application =
           new GuiceApplicationBuilder()
@@ -55,19 +58,25 @@ public abstract class BaseApplicationTest {
       Helpers.start(application);
       system = ActorSystem.create("system");
       props = Props.create(actorClass);
-      ActorRef subject = system.actorOf(props);
-      BaseController.setActorRef(subject);
-      mockStatic(RequestInterceptor.class);
+      subject = system.actorOf(props);
+     // BaseController.setActorRef(subject);
+      applicationSetUp();
+/*      mockStatic(RequestInterceptor.class);*/
       mockStatic(TelemetryWriter.class);
-      PowerMockito.when(RequestInterceptor.verifyRequestData(Mockito.anyObject()))
+   /*   PowerMockito.when(RequestInterceptor.verifyRequestData(Mockito.anyObject()))
           .thenReturn(userAuthentication);
-      mockStatic(OnRequestHandler.class);
-      PowerMockito.doReturn("12345678990").when(OnRequestHandler.class, "getCustodianOrgHashTagId");
+      mockStatic(OnRequestHandler.class);*/
+
     } catch (Exception e) {
       e.printStackTrace();
     }
   }
-
+  public void applicationSetUp() {
+    app = PowerMockito.mock(SunbirdMWService.class);
+    //PowerMockito.mockStatic(org.sunbird.Application.class);
+   // PowerMockito.when(SunbirdMWService.init()).thenReturn(app);
+   // app.init();
+  }
   public Result performTest(String url, String method) {
     Http.RequestBuilder req = new Http.RequestBuilder().uri(url).method(method);
     Result result = Helpers.route(application, req);

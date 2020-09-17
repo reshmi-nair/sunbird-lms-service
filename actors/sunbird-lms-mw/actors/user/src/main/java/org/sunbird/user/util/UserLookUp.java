@@ -22,8 +22,8 @@ import org.sunbird.models.user.User;
 
 public class UserLookUp {
   private static LoggerUtil logger = new LoggerUtil(UserLookUp.class);
-  private static CassandraOperation cassandraOperation = ServiceFactory.getInstance();
-  private static EncryptionService encryptionService =
+  private CassandraOperation cassandraOperation = ServiceFactory.getInstance();
+  private EncryptionService encryptionService =
       org.sunbird.common.models.util.datasecurity.impl.ServiceFactory.getEncryptionServiceInstance(
           null);
   private static Util.DbInfo userLookUp = Util.dbInfoMap.get(JsonKey.USER_LOOKUP);
