@@ -3,12 +3,13 @@ package org.sunbird.user.service;
 import static org.powermock.api.mockito.PowerMockito.mock;
 import static org.powermock.api.mockito.PowerMockito.when;
 
-import akka.dispatch.ExecutionContexts;
+import akka.dispatch.Futures;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executors;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -20,13 +21,18 @@ import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
 import org.sunbird.cassandra.CassandraOperation;
 import org.sunbird.cassandraimpl.CassandraOperationImpl;
+import org.sunbird.common.ElasticSearchHelper;
+import org.sunbird.common.ElasticSearchRestHighImpl;
 import org.sunbird.common.exception.ProjectCommonException;
+import org.sunbird.common.factory.EsClientFactory;
 import org.sunbird.common.models.response.Response;
 import org.sunbird.common.models.util.ActorOperations;
+import org.sunbird.common.models.util.GeoLocationJsonKey;
 import org.sunbird.common.models.util.JsonKey;
 import org.sunbird.common.request.Request;
 import org.sunbird.common.request.RequestContext;
 import org.sunbird.common.responsecode.ResponseCode;
+import org.sunbird.dto.SearchDTO;
 import org.sunbird.helper.ServiceFactory;
 import org.sunbird.learner.util.DataCacheHandler;
 import org.sunbird.learner.util.UserUtility;
@@ -37,7 +43,7 @@ import org.sunbird.user.dao.UserOrgDao;
 import org.sunbird.user.dao.impl.UserDaoImpl;
 import org.sunbird.user.dao.impl.UserOrgDaoImpl;
 import org.sunbird.user.util.UserUtil;
-import scala.concurrent.ExecutionContextExecutor;
+import scala.concurrent.Promise;
 
 @RunWith(PowerMockRunner.class)
 @PrepareForTest({
@@ -50,7 +56,10 @@ import scala.concurrent.ExecutionContextExecutor;
   UserOrgDao.class,
   UserOrgDaoImpl.class,
   UserUtility.class,
-  Util.class
+  Util.class,
+  ElasticSearchRestHighImpl.class,
+  EsClientFactory.class,
+  ElasticSearchHelper.class
 })
 @PowerMockIgnore("javax.management.*")
 public class UserProfileReadServiceTest {
@@ -63,9 +72,6 @@ public class UserProfileReadServiceTest {
   private String orgAdminTnc =
       "{\"latestVersion\":\"v1\",\"v1\":{\"url\":\"http://dev/terms.html\"},\"v2\":{\"url\":\"http://dev/terms.html\"},\"v4\":{\"url\":\"http://dev/terms.html\"}}";
 
-  private ExecutionContextExecutor executor =
-      ExecutionContexts.fromExecutor(Executors.newFixedThreadPool(1));
-
   @Before
   public void beforeEachTest() {
     PowerMockito.mockStatic(DataCacheHandler.class);
@@ -77,7 +83,20 @@ public class UserProfileReadServiceTest {
   }
 
   @Test
-  public void getUserProfileDataTest() {
+  public void getUserProfileDataTest() throws JsonProcessingException {
+    PowerMockito.mockStatic(EsClientFactory.class);
+    ElasticSearchRestHighImpl esSearch = mock(ElasticSearchRestHighImpl.class);
+    when(EsClientFactory.getInstance(Mockito.anyString())).thenReturn(esSearch);
+    Map<String, Object> esRespone = new HashMap<>();
+    esRespone.put(JsonKey.CONTENT, new ArrayList<>());
+    esRespone.put(GeoLocationJsonKey.LOCATION_TYPE, "STATE");
+    Promise<Map<String, Object>> promise = Futures.promise();
+    promise.success(esRespone);
+
+    when(esSearch.search(
+            Mockito.any(SearchDTO.class), Mockito.anyString(), Mockito.any(RequestContext.class)))
+        .thenReturn(promise.future());
+
     PowerMockito.mockStatic(ServiceFactory.class);
     CassandraOperation cassandraOperationImpl = mock(CassandraOperation.class);
     when(ServiceFactory.getInstance()).thenReturn(cassandraOperationImpl);
@@ -85,6 +104,7 @@ public class UserProfileReadServiceTest {
     List<Map<String, Object>> resp = new ArrayList<>();
     Map<String, Object> userList = new HashMap<>();
     userList.put(JsonKey.USER_ID, "1234");
+    userList.put(JsonKey.IS_DELETED, false);
     userList.put(JsonKey.IS_DELETED, false);
     resp.add(userList);
     response.put(JsonKey.RESPONSE, resp);
@@ -96,13 +116,23 @@ public class UserProfileReadServiceTest {
     List<Map<String, Object>> resp2 = new ArrayList<>();
     Map<String, Object> userList2 = new HashMap<>();
     userList2.put(JsonKey.USER_ID, "1234");
+    userList2.put(JsonKey.ORG_NAME, "rootOrg");
+    userList2.put(JsonKey.IS_DELETED, false);
     userList2.put(JsonKey.ORGANISATION_ID, "4578963210");
     List<String> roles = new ArrayList<>();
     roles.add("PUBLIC");
     roles.add("ORG_ADMIN");
     userList2.put(JsonKey.ROLES, roles);
 
+    Map<String, Object> userList3 = new HashMap<>();
+    userList3.put(JsonKey.USER_ID, "1234");
+    userList3.put(JsonKey.ORG_NAME, "subOrg");
+    userList3.put(JsonKey.IS_DELETED, false);
+    userList3.put(JsonKey.ORGANISATION_ID, "457896321012");
+    userList3.put(JsonKey.ROLES, roles);
+
     resp2.add(userList2);
+    resp2.add(userList3);
     response2.put(JsonKey.RESPONSE, resp2);
     when(cassandraOperationImpl.getRecordById(
             Mockito.anyString(), Mockito.anyString(), Mockito.anyMap(), Mockito.any()))
@@ -115,7 +145,7 @@ public class UserProfileReadServiceTest {
     PowerMockito.mockStatic(Util.class);
     Mockito.when(UserUtility.decryptUserData(Mockito.anyMap()))
         .thenReturn(getUserDbMap("1234567890"));
-    Mockito.when(userDao.getUserById("1234567890", null))
+    Mockito.when(userDao.getUserDetailsById("1234567890", null))
         .thenReturn(getValidUserResponse("1234567890"));
 
     UserOrgDao userOrgDao = PowerMockito.mock(UserOrgDao.class);
@@ -153,9 +183,33 @@ public class UserProfileReadServiceTest {
     locn2.put(JsonKey.TYPE, "district");
     locn2.put(JsonKey.PARENT_ID, "location1");
 
+    Map<String, Object> block = new HashMap<>();
+    block.put(JsonKey.ID, "blockId");
+    block.put(JsonKey.CODE, "block1");
+    block.put(JsonKey.NAME, "block1");
+    block.put(JsonKey.TYPE, "block");
+    block.put(JsonKey.PARENT_ID, "location2");
+
+    Map<String, Object> cluster = new HashMap<>();
+    cluster.put(JsonKey.ID, "clusterId");
+    cluster.put(JsonKey.CODE, "cluster1");
+    cluster.put(JsonKey.NAME, "cluster1");
+    cluster.put(JsonKey.TYPE, "cluster");
+    cluster.put(JsonKey.PARENT_ID, "blockId");
+
+    Map<String, Object> school = new HashMap<>();
+    school.put(JsonKey.ID, "schoolId");
+    school.put(JsonKey.CODE, "school1");
+    school.put(JsonKey.NAME, "school1");
+    school.put(JsonKey.TYPE, "school");
+    school.put(JsonKey.PARENT_ID, "clusterId");
+
     List<Map<String, Object>> locnList = new ArrayList<>();
     locnList.add(locn);
     locnList.add(locn2);
+    locnList.add(block);
+    locnList.add(cluster);
+    locnList.add(school);
     Response locnResponse = new Response();
     locnResponse.getResult().put(JsonKey.RESPONSE, locnList);
 
@@ -172,7 +226,7 @@ public class UserProfileReadServiceTest {
         .thenReturn(locnResponse)
         .thenReturn(locnResponse);
 
-    UserProfileReadService userProfileReadService = new UserProfileReadService(executor);
+    UserProfileReadService userProfileReadService = new UserProfileReadService();
 
     List<Map<String, String>> externalIds = new ArrayList<>();
     Map<String, String> externalId = new HashMap<>();
@@ -213,7 +267,7 @@ public class UserProfileReadServiceTest {
   }
 
   @Test
-  public void getUserProfileWithEmptyResultTest() {
+  public void getUserProfileWithEmptyResultTest() throws JsonProcessingException {
     PowerMockito.mockStatic(ServiceFactory.class);
     CassandraOperation cassandraOperationImpl = mock(CassandraOperation.class);
     when(ServiceFactory.getInstance()).thenReturn(cassandraOperationImpl);
@@ -231,7 +285,7 @@ public class UserProfileReadServiceTest {
     Mockito.when(UserUtility.decryptUserData(Mockito.anyMap()))
         .thenReturn(getUserDbMap("1234567890"));
     Mockito.when(userDao.getUserById("1234567890", null)).thenReturn(null);
-    UserProfileReadService userProfileReadService = new UserProfileReadService(executor);
+    UserProfileReadService userProfileReadService = new UserProfileReadService();
     try {
       userProfileReadService.getUserProfileData(getProfileReadRequest("1234567890"));
     } catch (ProjectCommonException ex) {
@@ -241,7 +295,7 @@ public class UserProfileReadServiceTest {
   }
 
   @Test
-  public void getLockedUserProfileTest() {
+  public void getLockedUserProfileTest() throws JsonProcessingException {
     PowerMockito.mockStatic(ServiceFactory.class);
     CassandraOperation cassandraOperationImpl = mock(CassandraOperation.class);
     when(ServiceFactory.getInstance()).thenReturn(cassandraOperationImpl);
@@ -258,10 +312,10 @@ public class UserProfileReadServiceTest {
     PowerMockito.mockStatic(Util.class);
     Mockito.when(UserUtility.decryptUserData(Mockito.anyMap()))
         .thenReturn(getUserDbMap("1234567890"));
-    User user = getValidUserResponse("1234567890");
-    user.setIsDeleted(true);
-    Mockito.when(userDao.getUserById("1234567890", null)).thenReturn(user);
-    UserProfileReadService userProfileReadService = new UserProfileReadService(executor);
+    Map<String, Object> user = getValidUserResponse("1234567890");
+    user.put(JsonKey.IS_DELETED, true);
+    Mockito.when(userDao.getUserDetailsById("1234567890", null)).thenReturn(user);
+    UserProfileReadService userProfileReadService = new UserProfileReadService();
     try {
       userProfileReadService.getUserProfileData(getProfileReadRequest("1234567890"));
     } catch (ProjectCommonException ex) {
@@ -290,7 +344,7 @@ public class UserProfileReadServiceTest {
     return reqMap;
   }
 
-  private User getValidUserResponse(String userid) {
+  private Map<String, Object> getValidUserResponse(String userid) throws JsonProcessingException {
     User user = new User();
     user.setId(userid);
     user.setEmail("anyEmail@gmail.com");
@@ -305,11 +359,31 @@ public class UserProfileReadServiceTest {
     user.setUserId(userid);
     user.setFirstName("Demo Name");
     user.setUserName("validUserName");
-    return user;
+    // {'groupsTnc': '{"tncAcceptedOn":"2021-01-04 19:45:29:725+0530","version":"3.9.0"}'}
+    Map<String, String> tncMap = new HashMap<>();
+    tncMap.put("tncAcceptedOn", "2021-01-04 19:45:29:725+0530");
+    tncMap.put("version", "3.9.0");
+    ObjectMapper mapper = new ObjectMapper();
+    String tnc = mapper.writeValueAsString(tncMap);
+    Map<String, String> groupTncMap = new HashMap<>();
+    groupTncMap.put("groupsTnc", tnc);
+    user.setAllTncAccepted(groupTncMap);
+    ArrayList<String> locationList =
+        new ArrayList<String>() {
+          {
+            add("location1");
+            add("location2");
+          }
+        };
+    user.setLocationIds(locationList);
+    ObjectMapper mapper1 = new ObjectMapper();
+    Map<String, Object> result = mapper.convertValue(user, Map.class);
+    return result;
   }
 
-  private Map<String, Object> getUserDbMap(String userid) {
+  private Map<String, Object> getUserDbMap(String userid) throws JsonProcessingException {
     Map<String, Object> userDbMap = new HashMap<>();
+    String[] locationIds = new String[] {"location1", "location2"};
     userDbMap.put(JsonKey.USERNAME, "validUserName");
     userDbMap.put(JsonKey.CHANNEL, "channel");
     userDbMap.put(JsonKey.EMAIL, "anyEmail@gmail.com");
@@ -322,6 +396,16 @@ public class UserProfileReadServiceTest {
     userDbMap.put(JsonKey.ID, userid);
     userDbMap.put(JsonKey.FIRST_NAME, "Demo Name");
     userDbMap.put(JsonKey.IS_DELETED, false);
+    userDbMap.put(JsonKey.LOCATION_IDS, locationIds);
+    // {'groupsTnc': '{"tncAcceptedOn":"2021-01-04 19:45:29:725+0530","version":"3.9.0"}'}
+    Map<String, String> tncMap = new HashMap<>();
+    tncMap.put("tncAcceptedOn", "2021-01-04 19:45:29:725+0530");
+    tncMap.put("version", "3.9.0");
+    ObjectMapper mapper = new ObjectMapper();
+    String tnc = mapper.writeValueAsString(tncMap);
+    Map<String, String> groupTncMap = new HashMap<>();
+    groupTncMap.put("groupsTnc", tnc);
+    userDbMap.put(JsonKey.ALL_TNC_ACCEPTED, groupTncMap);
     return userDbMap;
   }
 }

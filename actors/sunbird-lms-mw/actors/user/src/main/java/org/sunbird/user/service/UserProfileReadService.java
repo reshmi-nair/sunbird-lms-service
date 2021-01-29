@@ -1,11 +1,10 @@
 package org.sunbird.user.service;
 
-import akka.dispatch.Futures;
-import akka.dispatch.Mapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -16,7 +15,10 @@ import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.collections.MapUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.sunbird.cassandra.CassandraOperation;
+import org.sunbird.common.ElasticSearchHelper;
 import org.sunbird.common.exception.ProjectCommonException;
+import org.sunbird.common.factory.EsClientFactory;
+import org.sunbird.common.inf.ElasticSearchService;
 import org.sunbird.common.models.response.Response;
 import org.sunbird.common.models.util.JsonKey;
 import org.sunbird.common.models.util.LoggerUtil;
@@ -24,13 +26,14 @@ import org.sunbird.common.models.util.ProjectUtil;
 import org.sunbird.common.request.Request;
 import org.sunbird.common.request.RequestContext;
 import org.sunbird.common.responsecode.ResponseCode;
+import org.sunbird.dto.SearchDTO;
 import org.sunbird.helper.ServiceFactory;
 import org.sunbird.learner.organisation.dao.OrgDao;
 import org.sunbird.learner.organisation.dao.impl.OrgDaoImpl;
 import org.sunbird.learner.util.DataCacheHandler;
+import org.sunbird.learner.util.UserFlagUtil;
 import org.sunbird.learner.util.UserUtility;
 import org.sunbird.learner.util.Util;
-import org.sunbird.models.user.User;
 import org.sunbird.user.dao.UserDao;
 import org.sunbird.user.dao.UserOrgDao;
 import org.sunbird.user.dao.impl.UserDaoImpl;
@@ -38,7 +41,6 @@ import org.sunbird.user.dao.impl.UserOrgDaoImpl;
 import org.sunbird.user.service.impl.UserExternalIdentityServiceImpl;
 import org.sunbird.user.service.impl.UserServiceImpl;
 import org.sunbird.user.util.UserUtil;
-import scala.concurrent.ExecutionContextExecutor;
 import scala.concurrent.Future;
 
 public class UserProfileReadService {
@@ -47,19 +49,15 @@ public class UserProfileReadService {
   private CassandraOperation cassandraOperation = ServiceFactory.getInstance();
   private Util.DbInfo locationDbInfo = Util.dbInfoMap.get(JsonKey.LOCATION);
   private UserService userService = UserServiceImpl.getInstance();
+  private UserTncService tncService = new UserTncService();
   private UserOrgDao userOrgDao = UserOrgDaoImpl.getInstance();
   private OrgDao orgDao = OrgDaoImpl.getInstance();
   private Util.DbInfo OrgDb = Util.dbInfoMap.get(JsonKey.ORG_DB);
   private UserDao userDao = UserDaoImpl.getInstance();
   private UserExternalIdentityService userExternalIdentityService =
       new UserExternalIdentityServiceImpl();
+  private ElasticSearchService esUtil = EsClientFactory.getInstance(JsonKey.REST);
   private ObjectMapper mapper = new ObjectMapper();
-  private ExecutionContextExecutor executor;
-
-  public UserProfileReadService(ExecutionContextExecutor executor) {
-    super();
-    this.executor = executor;
-  }
 
   public Response getUserProfileData(Request actorMessage) {
     String id = (String) actorMessage.getRequest().get(JsonKey.USER_ID);
@@ -100,14 +98,12 @@ public class UserProfileReadService {
       ProjectCommonException.throwUnauthorizedErrorException();
     }
 
-    Future<Map<String, Object>> managedTokenFuture =
-        Futures.future(() -> getManagedToken(actorMessage, userId, result, managedBy), executor);
+    getManagedToken(actorMessage, userId, result, managedBy);
 
     String requestFields = (String) actorMessage.getContext().get(JsonKey.FIELDS);
     if (StringUtils.isNotBlank(userId)
         && (userId.equalsIgnoreCase(requestedById) || userId.equalsIgnoreCase(managedForId))
-        && (StringUtils.isNotBlank(requestFields)
-            && !requestFields.contains(JsonKey.EXTERNAL_IDS))) {
+        && StringUtils.isBlank(requestFields)) {
       result.put(
           JsonKey.EXTERNAL_IDS,
           fetchUserExternalIdentity(userId, result, true, actorMessage.getRequestContext()));
@@ -117,19 +113,24 @@ public class UserProfileReadService {
     }
     UserUtility.decryptUserDataFrmES(result);
     updateTnc(result);
-    managedTokenFuture.map(
-        new Mapper<Map<String, Object>, Map<String, Object>>() {
-          @Override
-          public Map<String, Object> apply(Map<String, Object> managedRes) {
-            return managedRes;
-          }
-        },
-        executor);
+    if (null != result.get(JsonKey.ALL_TNC_ACCEPTED)) {
+      result.put(
+          JsonKey.ALL_TNC_ACCEPTED,
+          tncService.convertTncStringToJsonMap(
+              (Map<String, String>) result.get(JsonKey.ALL_TNC_ACCEPTED)));
+    }
+    addFlagValue(result);
     // For Backward compatibility , In ES we were sending identifier field
     result.put(JsonKey.IDENTIFIER, userId);
     Response response = new Response();
     response.put(JsonKey.RESPONSE, result);
     return response;
+  }
+
+  private void addFlagValue(Map<String, Object> userDetails) {
+    int flagsValue = Integer.parseInt(userDetails.get(JsonKey.FLAGS_VALUE).toString());
+    Map<String, Boolean> userFlagMap = UserFlagUtil.assignUserFlagValues(flagsValue);
+    userDetails.putAll(userFlagMap);
   }
 
   private Map<String, Object> getManagedToken(
@@ -161,28 +162,35 @@ public class UserProfileReadService {
 
   private List<Map<String, Object>> fetchUserOrgList(String userId, RequestContext requestContext) {
     Response response = userOrgDao.getUserOrgListByUserId(userId, requestContext);
-    return (List<Map<String, Object>>) response.get(JsonKey.RESPONSE);
+    List<Map<String, Object>> userOrgList =
+        (List<Map<String, Object>>) response.get(JsonKey.RESPONSE);
+    List<Map<String, Object>> usrOrgList = new ArrayList<>();
+    for (Map<String, Object> userOrg : userOrgList) {
+      Boolean isDeleted = (Boolean) userOrg.get(JsonKey.IS_DELETED);
+      if (null == isDeleted || (null != isDeleted && !isDeleted.booleanValue())) {
+        usrOrgList.add(userOrg);
+      }
+    }
+    return usrOrgList;
   }
 
   private Map<String, Object> validateUserIdAndGetUserDetails(
       String userId, RequestContext context) {
-    User user = userDao.getUserById(userId, context);
+    Map<String, Object> user = userDao.getUserDetailsById(userId, context);
     // check user found or not
-    if (null == user) {
+    if (MapUtils.isEmpty(user)) {
       throw new ProjectCommonException(
           ResponseCode.userNotFound.getErrorCode(),
           ResponseCode.userNotFound.getErrorMessage(),
           ResponseCode.RESOURCE_NOT_FOUND.getResponseCode());
     }
     // check whether is_deletd true or false
-    Boolean isDeleted = user.getIsDeleted();
+    Boolean isDeleted = (Boolean) user.get(JsonKey.IS_DELETED);
     if (null != isDeleted && isDeleted.booleanValue()) {
       ProjectCommonException.throwClientErrorException(ResponseCode.userAccountlocked);
     }
-
-    Map<String, Object> result = mapper.convertValue(user, Map.class);
-    removeUserPrivateField(result);
-    return result;
+    removeUserPrivateField(user);
+    return user;
   }
 
   private String getUserIdByExternalId(
@@ -335,14 +343,14 @@ public class UserProfileReadService {
         String tncUserAcceptedVersion = (String) userMap.get(JsonKey.TNC_ACCEPTED_VERSION);
         Object tncUserAcceptedOn = userMap.get(JsonKey.TNC_ACCEPTED_ON);
         userMap.put(JsonKey.PROMPT_TNC, false);
+        String url = (String) ((Map) tncConfigMap.get(tncLatestVersion)).get(JsonKey.URL);
+        logger.info("UserProfileReadActor:updateTncInfo: url = " + url);
+        userMap.put(JsonKey.TNC_LATEST_VERSION_URL, url);
         if ((StringUtils.isEmpty(tncUserAcceptedVersion)
                 || !tncUserAcceptedVersion.equalsIgnoreCase(tncLatestVersion)
                 || (null == tncUserAcceptedOn))
             && (tncConfigMap.containsKey(tncLatestVersion))) {
           userMap.put(JsonKey.PROMPT_TNC, true);
-          String url = (String) ((Map) tncConfigMap.get(tncLatestVersion)).get(JsonKey.URL);
-          logger.info("UserProfileReadActor:updateTncInfo: url = " + url);
-          userMap.put(JsonKey.TNC_LATEST_VERSION_URL, url);
         }
       } catch (Exception e) {
         logger.error(
@@ -404,10 +412,16 @@ public class UserProfileReadService {
         result.put(JsonKey.ROLE_LIST, DataCacheHandler.getUserReadRoleList());
       }
       if (fields.contains(JsonKey.LOCATIONS)) {
-        result.put(
-            JsonKey.USER_LOCATIONS,
-            getUserLocations((List<String>) result.get(JsonKey.LOCATION_IDS), context));
-        result.remove(JsonKey.LOCATION_IDS);
+        List<Map<String, Object>> userLocations =
+            getUserLocations((List<String>) result.get(JsonKey.LOCATION_IDS), context);
+        if (CollectionUtils.isNotEmpty(userLocations)) {
+          result.put(
+              JsonKey.USER_LOCATIONS,
+              getUserLocations((List<String>) result.get(JsonKey.LOCATION_IDS), context));
+
+          addSchoolLocation(result, context);
+          result.remove(JsonKey.LOCATION_IDS);
+        }
       }
       if (fields.contains(JsonKey.DECLARATIONS)) {
         List<Map<String, Object>> declarations =
@@ -421,6 +435,49 @@ public class UserProfileReadService {
         result.put(JsonKey.EXTERNAL_IDS, resExternalIds);
       }
     }
+  }
+
+  private void addSchoolLocation(Map<String, Object> result, RequestContext context) {
+    String rootOrgId = (String) result.get(JsonKey.ROOT_ORG_ID);
+    List<Map<String, Object>> organisations =
+        (List<Map<String, Object>>) result.get(JsonKey.ORGANISATIONS);
+    List<Map<String, Object>> userLocation =
+        (List<Map<String, Object>>) result.get(JsonKey.USER_LOCATIONS);
+    // inorder to add school, user should have sub-org and attached to locations hierarchy as parent
+    // block/cluster
+    if (CollectionUtils.isNotEmpty(organisations)
+        && organisations.size() > 1
+        && userLocation.size() >= 3) {
+      for (int i = 0; i < organisations.size(); i++) {
+        String organisationId = (String) organisations.get(i).get(JsonKey.ORGANISATION_ID);
+        if (StringUtils.isNotBlank(organisationId) && !organisationId.equalsIgnoreCase(rootOrgId)) {
+          Map<String, Object> filterMap = new HashMap<>();
+          Map<String, Object> searchQueryMap = new HashMap<>();
+          filterMap.put(JsonKey.NAME, organisations.get(i).get(JsonKey.ORG_NAME));
+          filterMap.put(JsonKey.TYPE, JsonKey.LOCATION_TYPE_SCHOOL);
+          filterMap.put(JsonKey.CODE, organisations.get(i).get(JsonKey.EXTERNAL_ID));
+          searchQueryMap.put(JsonKey.FILTERS, filterMap);
+          Map<String, Object> schoolLocation = searchLocation(searchQueryMap, context);
+          if (MapUtils.isNotEmpty(schoolLocation)) {
+            userLocation.add(schoolLocation);
+          }
+        }
+      }
+    }
+  }
+
+  public Map<String, Object> searchLocation(
+      Map<String, Object> searchQueryMap, RequestContext context) {
+    SearchDTO searchDto = Util.createSearchDto(searchQueryMap);
+    String type = ProjectUtil.EsType.location.getTypeName();
+    Future<Map<String, Object>> resultF = esUtil.search(searchDto, type, context);
+    Map<String, Object> result =
+        (Map<String, Object>) ElasticSearchHelper.getResponseFromFuture(resultF);
+    if (MapUtils.isNotEmpty(result)
+        && CollectionUtils.isNotEmpty((List<Map<String, Object>>) result.get(JsonKey.CONTENT))) {
+      return ((List<Map<String, Object>>) result.get(JsonKey.CONTENT)).get(0);
+    }
+    return Collections.emptyMap();
   }
 
   private List<Map<String, Object>> getUserLocations(
@@ -461,7 +518,8 @@ public class UserProfileReadService {
               JsonKey.CHANNEL,
               JsonKey.HASHTAGID,
               JsonKey.LOCATION_IDS,
-              JsonKey.ID);
+              JsonKey.ID,
+              JsonKey.EXTERNAL_ID);
       Response userOrgResponse =
           cassandraOperation.getPropertiesValueById(
               OrgDb.getKeySpace(), OrgDb.getTableName(), orgIds, fields, context);
@@ -513,6 +571,7 @@ public class UserProfileReadService {
         usrOrg.put(JsonKey.CHANNEL, orgInfo.get(JsonKey.CHANNEL));
         usrOrg.put(JsonKey.HASHTAGID, orgInfo.get(JsonKey.HASHTAGID));
         usrOrg.put(JsonKey.LOCATION_IDS, orgInfo.get(JsonKey.LOCATION_IDS));
+        usrOrg.put(JsonKey.EXTERNAL_ID, orgInfo.get(JsonKey.EXTERNAL_ID));
         if (MapUtils.isNotEmpty(locationInfoMap)) {
           usrOrg.put(
               JsonKey.LOCATIONS,
