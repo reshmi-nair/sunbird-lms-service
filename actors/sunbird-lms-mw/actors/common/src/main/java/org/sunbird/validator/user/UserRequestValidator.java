@@ -73,26 +73,6 @@ public class UserRequestValidator extends BaseRequestValidator {
     }
   }
 
-  /**
-   * This method will validate location type
-   *
-   * @param type
-   * @return
-   */
-  public static boolean isValidLocationType(String type) {
-    if (null != type && !typeList.contains(type.toLowerCase())) {
-      throw new ProjectCommonException(
-          ResponseCode.invalidValue.getErrorCode(),
-          ProjectUtil.formatMessage(
-              ResponseCode.invalidValue.getErrorMessage(),
-              GeoLocationJsonKey.LOCATION_TYPE,
-              type,
-              typeList),
-          ResponseCode.CLIENT_ERROR.getResponseCode());
-    }
-    return true;
-  }
-
   private void validateUserName(Request userRequest) {
     validateParam(
         (String) userRequest.getRequest().get(JsonKey.USERNAME),
